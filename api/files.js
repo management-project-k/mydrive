@@ -1,6 +1,6 @@
-// api/files.js - File Management Serverless Function
 const mysql = require('serverless-mysql');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const db = mysql({
     config: {
@@ -12,10 +12,10 @@ const db = mysql({
     }
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'mydrive_secret_2025';
+const JWT_SECRET = 'mydrive_secret_2025';
 
-async function getUserFromToken(req) {
-    const authHeader = req.headers.authorization || '';
+const getUserFromToken = (req) => {
+    const authHeader = req.headers.authorization || req.headers.Authorization || '';
     const token = authHeader.replace('Bearer ', '');
 
     if (!token) return null;
@@ -26,9 +26,9 @@ async function getUserFromToken(req) {
     } catch {
         return null;
     }
-}
+};
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -37,15 +37,13 @@ module.exports = async (req, res) => {
         return res.status(200).end();
     }
 
-    const userId = await getUserFromToken(req);
+    const userId = getUserFromToken(req);
     if (!userId) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
     try {
-        // ====================================================================
         // LIST FILES
-        // ====================================================================
         if (req.method === 'GET' && req.query.action === 'list') {
             const files = await db.query(
                 'SELECT file_id, file_name, file_size, file_type, cloudinary_url, uploaded_at FROM files WHERE user_id = ? ORDER BY uploaded_at DESC',
@@ -53,14 +51,17 @@ module.exports = async (req, res) => {
             );
 
             await db.end();
-            return res.status(200).json({ files, folders: [] });
+            return res.status(200).json({ files: files || [], folders: [] });
         }
 
-        // ====================================================================
         // UPLOAD FILE
-        // ====================================================================
         if (req.method === 'POST' && req.body.action === 'upload') {
             const { file, fileName, fileSize } = req.body;
+
+            if (!file || !fileName) {
+                await db.end();
+                return res.status(400).json({ error: 'File and filename required' });
+            }
 
             if (fileSize > 5 * 1024 * 1024) {
                 await db.end();
@@ -72,15 +73,21 @@ module.exports = async (req, res) => {
                 'SELECT storage_used, storage_limit FROM users WHERE user_id = ?',
                 [userId]
             );
+
+            if (!users || users.length === 0) {
+                await db.end();
+                return res.status(404).json({ error: 'User not found' });
+            }
+
             const user = users[0];
 
-            if (user.storage_used + fileSize > user.storage_limit) {
+            if (Number(user.storage_used) + fileSize > Number(user.storage_limit)) {
                 await db.end();
                 return res.status(403).json({ error: 'Storage quota exceeded' });
             }
 
             // Generate file ID
-            const fileId = require('crypto').randomBytes(16).toString('hex');
+            const fileId = crypto.randomBytes(16).toString('hex');
 
             // Insert file
             await db.query(
@@ -95,10 +102,14 @@ module.exports = async (req, res) => {
             );
 
             // Log activity
-            await db.query(
-                'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
-                [userId, 'FILE_UPLOAD', `Uploaded ${fileName}`]
-            );
+            try {
+                await db.query(
+                    'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
+                    [userId, 'FILE_UPLOAD', `Uploaded ${fileName}`]
+                );
+            } catch (e) {
+                console.log('Activity log error:', e);
+            }
 
             await db.end();
             return res.status(200).json({
@@ -109,22 +120,26 @@ module.exports = async (req, res) => {
             });
         }
 
-        // ====================================================================
         // DELETE FILE
-        // ====================================================================
         if (req.method === 'DELETE' && req.query.action === 'delete') {
             const { fileId } = req.query;
+
+            if (!fileId) {
+                await db.end();
+                return res.status(400).json({ error: 'File ID required' });
+            }
 
             const files = await db.query(
                 'SELECT * FROM files WHERE file_id = ? AND user_id = ?',
                 [fileId, userId]
             );
-            const file = files[0];
 
-            if (!file) {
+            if (!files || files.length === 0) {
                 await db.end();
                 return res.status(404).json({ error: 'File not found' });
             }
+
+            const file = files[0];
 
             await db.query('DELETE FROM files WHERE file_id = ?', [fileId]);
 
@@ -133,10 +148,14 @@ module.exports = async (req, res) => {
                 [file.file_size, userId]
             );
 
-            await db.query(
-                'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
-                [userId, 'FILE_DELETE', `Deleted ${file.file_name}`]
-            );
+            try {
+                await db.query(
+                    'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
+                    [userId, 'FILE_DELETE', `Deleted ${file.file_name}`]
+                );
+            } catch (e) {
+                console.log('Activity log error:', e);
+            }
 
             await db.end();
             return res.status(200).json({ message: 'File deleted successfully' });
@@ -147,7 +166,9 @@ module.exports = async (req, res) => {
 
     } catch (error) {
         console.error('Files error:', error);
-        await db.end();
-        return res.status(500).json({ error: 'Server error' });
+        try {
+            await db.end();
+        } catch (e) {}
+        return res.status(500).json({ error: 'Server error: ' + error.message });
     }
-};
+}
