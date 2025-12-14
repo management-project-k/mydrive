@@ -1,4 +1,3 @@
-// api/auth.js - Authentication Serverless Function
 const mysql = require('serverless-mysql');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -13,10 +12,10 @@ const db = mysql({
     }
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'mydrive_secret_2025';
+const JWT_SECRET = 'mydrive_secret_2025';
 
-async function getUserFromToken(req) {
-    const authHeader = req.headers.authorization || '';
+const getUserFromToken = (req) => {
+    const authHeader = req.headers.authorization || req.headers.Authorization || '';
     const token = authHeader.replace('Bearer ', '');
 
     if (!token) return null;
@@ -27,10 +26,10 @@ async function getUserFromToken(req) {
     } catch {
         return null;
     }
-}
+};
 
-module.exports = async (req, res) => {
-    // CORS headers
+export default async function handler(req, res) {
+    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -39,25 +38,40 @@ module.exports = async (req, res) => {
         return res.status(200).end();
     }
 
-    const { action, userId, password, newPassword } = req.body;
-
     try {
-        // ====================================================================
-        // LOGIN
-        // ====================================================================
-        if (action === 'login') {
-            const users = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
-            const user = users[0];
+        const { action, userId, password, newPassword } = req.body || {};
 
-            if (!user || !await bcrypt.compare(password, user.password_hash)) {
+        // LOGIN
+        if (action === 'login') {
+            if (!userId || !password) {
+                await db.end();
+                return res.status(400).json({ error: 'User ID and password required' });
+            }
+
+            const users = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+
+            if (!users || users.length === 0) {
+                await db.end();
+                return res.status(401).json({ error: 'Invalid credentials' });
+            }
+
+            const user = users[0];
+            const validPassword = await bcrypt.compare(password, user.password_hash);
+
+            if (!validPassword) {
+                await db.end();
                 return res.status(401).json({ error: 'Invalid credentials' });
             }
 
             // Log activity
-            await db.query(
-                'INSERT INTO activity_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)',
-                [userId, 'LOGIN', 'User logged in', req.headers['x-forwarded-for'] || 'unknown']
-            );
+            try {
+                await db.query(
+                    'INSERT INTO activity_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)',
+                    [userId, 'LOGIN', 'User logged in', req.headers['x-forwarded-for'] || 'unknown']
+                );
+            } catch (e) {
+                console.log('Activity log error:', e);
+            }
 
             const token = jwt.sign({ userId: user.user_id }, JWT_SECRET, { expiresIn: '7d' });
 
@@ -74,16 +88,16 @@ module.exports = async (req, res) => {
             });
         }
 
-        // ====================================================================
         // RESET PASSWORD
-        // ====================================================================
         if (action === 'reset-password') {
-            const currentUserId = await getUserFromToken(req);
+            const currentUserId = getUserFromToken(req);
             if (!currentUserId) {
+                await db.end();
                 return res.status(401).json({ error: 'Unauthorized' });
             }
 
             if (!newPassword || newPassword.length < 8) {
+                await db.end();
                 return res.status(400).json({ error: 'Password must be at least 8 characters' });
             }
 
@@ -94,10 +108,14 @@ module.exports = async (req, res) => {
                 [passwordHash, currentUserId]
             );
 
-            await db.query(
-                'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
-                [currentUserId, 'PASSWORD_RESET', 'User reset password']
-            );
+            try {
+                await db.query(
+                    'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
+                    [currentUserId, 'PASSWORD_RESET', 'User reset password']
+                );
+            } catch (e) {
+                console.log('Activity log error:', e);
+            }
 
             await db.end();
 
@@ -109,7 +127,9 @@ module.exports = async (req, res) => {
 
     } catch (error) {
         console.error('Auth error:', error);
-        await db.end();
-        return res.status(500).json({ error: 'Server error' });
+        try {
+            await db.end();
+        } catch (e) {}
+        return res.status(500).json({ error: 'Server error: ' + error.message });
     }
-};
+}
