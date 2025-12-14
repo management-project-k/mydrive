@@ -1,4 +1,3 @@
-// api/admin.js - Admin Panel Serverless Function
 const mysql = require('serverless-mysql');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -13,10 +12,10 @@ const db = mysql({
     }
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'mydrive_secret_2025';
+const JWT_SECRET = 'mydrive_secret_2025';
 
-async function getUserFromToken(req) {
-    const authHeader = req.headers.authorization || '';
+const getUserFromToken = (req) => {
+    const authHeader = req.headers.authorization || req.headers.Authorization || '';
     const token = authHeader.replace('Bearer ', '');
 
     if (!token) return null;
@@ -27,9 +26,9 @@ async function getUserFromToken(req) {
     } catch {
         return null;
     }
-}
+};
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -38,7 +37,7 @@ module.exports = async (req, res) => {
         return res.status(200).end();
     }
 
-    const userId = await getUserFromToken(req);
+    const userId = getUserFromToken(req);
     if (!userId) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
@@ -46,28 +45,30 @@ module.exports = async (req, res) => {
     try {
         // Check if admin
         const users = await db.query('SELECT is_admin FROM users WHERE user_id = ?', [userId]);
+
+        if (!users || users.length === 0) {
+            await db.end();
+            return res.status(404).json({ error: 'User not found' });
+        }
+
         const user = users[0];
 
-        if (!user || !user.is_admin) {
+        if (!user.is_admin) {
             await db.end();
             return res.status(403).json({ error: 'Admin access required' });
         }
 
-        // ====================================================================
         // LIST USERS
-        // ====================================================================
         if (req.method === 'GET' && req.query.action === 'list-users') {
             const allUsers = await db.query(
                 'SELECT user_id, email, storage_used, storage_limit, is_admin, created_at FROM users ORDER BY created_at DESC'
             );
 
             await db.end();
-            return res.status(200).json({ users: allUsers });
+            return res.status(200).json({ users: allUsers || [] });
         }
 
-        // ====================================================================
         // CREATE USER
-        // ====================================================================
         if (req.method === 'POST' && req.body.action === 'create-user') {
             const { userId: newUserId, email } = req.body;
 
@@ -87,15 +88,27 @@ module.exports = async (req, res) => {
 
             const passwordHash = await bcrypt.hash(tempPassword, 10);
 
-            await db.query(
-                'INSERT INTO users (user_id, email, password_hash, temp_password, must_reset_password, is_admin) VALUES (?, ?, ?, ?, 1, 0)',
-                [newUserId, email, passwordHash, tempPassword]
-            );
+            try {
+                await db.query(
+                    'INSERT INTO users (user_id, email, password_hash, temp_password, must_reset_password, is_admin) VALUES (?, ?, ?, ?, 1, 0)',
+                    [newUserId, email, passwordHash, tempPassword]
+                );
+            } catch (dbError) {
+                await db.end();
+                if (dbError.code === 'ER_DUP_ENTRY') {
+                    return res.status(409).json({ error: 'User ID or email already exists' });
+                }
+                throw dbError;
+            }
 
-            await db.query(
-                'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
-                [userId, 'USER_CREATED', `Created user ${newUserId}`]
-            );
+            try {
+                await db.query(
+                    'INSERT INTO activity_logs (user_id, action, details) VALUES (?, ?, ?)',
+                    [userId, 'USER_CREATED', `Created user ${newUserId}`]
+                );
+            } catch (e) {
+                console.log('Activity log error:', e);
+            }
 
             await db.end();
             return res.status(201).json({
@@ -110,12 +123,9 @@ module.exports = async (req, res) => {
 
     } catch (error) {
         console.error('Admin error:', error);
-        await db.end();
-
-        if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({ error: 'User ID or email already exists' });
-        }
-
-        return res.status(500).json({ error: 'Server error' });
+        try {
+            await db.end();
+        } catch (e) {}
+        return res.status(500).json({ error: 'Server error: ' + error.message });
     }
-};
+}
